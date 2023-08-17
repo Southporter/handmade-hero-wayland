@@ -15,6 +15,7 @@ const Dimensions = struct {
 const DisplayState = struct {
     running: bool = true,
     dimensions: Dimensions = Dimensions{},
+    context: *Context,
 };
 
 const Context = struct {
@@ -30,6 +31,38 @@ const Color = packed struct {
     b: u8,
     a: u8,
 };
+
+fn genBuffer(state: *DisplayState) !wl.Buffer {
+    const width = state.dimensions.width;
+    const height = state.dimensions.height;
+    const stride = width * 4;
+    const size = stride * height;
+
+    const fd = try os.memfd_create("handmade-hero-zig", 0);
+    try os.ftruncate(fd, @intCast(size));
+    const data = try os.mmap(null, @intCast(size), os.PROT.READ | os.PROT.WRITE, os.MAP.SHARED, fd, 0);
+    const background = Color{
+        .r = 0,
+        .g = 0,
+        .b = 0,
+        .a = 255,
+    };
+
+    var offset: usize = 0;
+    while (offset < @divExact(size, 4)) : (offset += 1) {
+        const i = offset * 4;
+        data[i] = background.r;
+        data[i + 1] = background.g;
+        data[i + 2] = background.b;
+        data[i + 3] = background.a;
+    }
+    // @memset(data, background);
+
+    const pool = try state.context.*.shm.?.createPool(fd, size);
+    defer pool.destroy();
+
+    return try pool.createBuffer(0, width, height, stride, wl.Shm.Format.argb8888);
+}
 
 pub fn main() !void {
     std.debug.print("Starting main\n", .{});
@@ -51,6 +84,7 @@ pub fn main() !void {
     if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
 
     const shm = context.shm orelse return error.NoWlShm;
+    _ = shm;
     const compositor = context.compositor orelse return error.NoWlCompositor;
     std.debug.print("Compositor: {s}\n", .{
         .name = wl.Compositor.getInterface().name,
@@ -59,39 +93,9 @@ pub fn main() !void {
     const decoration_manager = context.decoration_manager orelse return error.NoXdgDecorationManager;
 
     std.debug.print(" Got all the context objects", .{});
-    var display_state = DisplayState{};
+    var display_state = DisplayState{ .context = &context };
 
-    const buffer = blk: {
-        const width = display_state.dimensions.width;
-        const height = display_state.dimensions.height;
-        const stride = width * 4;
-        const size = stride * height;
-
-        const fd = try os.memfd_create("handmade-hero-zig", 0);
-        try os.ftruncate(fd, @intCast(size));
-        const data = try os.mmap(null, @intCast(size), os.PROT.READ | os.PROT.WRITE, os.MAP.SHARED, fd, 0);
-        const background = Color{
-            .r = 0,
-            .g = 0,
-            .b = 0,
-            .a = 255,
-        };
-
-        var offset: usize = 0;
-        while (offset < @divExact(size, 4)) : (offset += 1) {
-            const i = offset * 4;
-            data[i] = background.r;
-            data[i + 1] = background.g;
-            data[i + 2] = background.b;
-            data[i + 3] = background.a;
-        }
-        // @memset(data, background);
-
-        const pool = try shm.createPool(fd, size);
-        defer pool.destroy();
-
-        break :blk try pool.createBuffer(0, width, height, stride, wl.Shm.Format.argb8888);
-    };
+    const buffer = genBuffer(display_state);
     defer buffer.destroy();
 
     const surface = try compositor.createSurface();
@@ -117,8 +121,12 @@ pub fn main() !void {
     surface.attach(buffer, 0, 0);
     surface.commit();
 
+    var buf = buffer;
     while (display_state.running) {
         if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
+        buf = genBuffer(display_state);
+        surface.attach(buf, 0, 0);
+        surface.commit();
     }
 }
 
