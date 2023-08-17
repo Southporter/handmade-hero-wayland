@@ -13,9 +13,10 @@ const Dimensions = struct {
 };
 
 const DisplayState = struct {
-    running: bool = true,
     dimensions: Dimensions = Dimensions{},
     context: *Context,
+    running: bool = true,
+    resizing: bool = false,
 };
 
 const Context = struct {
@@ -32,22 +33,27 @@ const Color = packed struct {
     a: u8,
 };
 
-fn genBuffer(state: *DisplayState) !wl.Buffer {
+const background = Color{
+    .r = 0,
+    .g = 0,
+    .b = 0,
+    .a = 128,
+};
+
+const Buffer = struct {
+    buffer: *wl.Buffer,
+    fd: os.fd_t,
+};
+
+fn genBuffer(state: *DisplayState) !Buffer {
     const width = state.dimensions.width;
     const height = state.dimensions.height;
     const stride = width * 4;
     const size = stride * height;
 
-    const fd = try os.memfd_create("handmade-hero-zig", 0);
+    const fd = try os.memfd_create("handmade-hero-zig-0", 0);
     try os.ftruncate(fd, @intCast(size));
     const data = try os.mmap(null, @intCast(size), os.PROT.READ | os.PROT.WRITE, os.MAP.SHARED, fd, 0);
-    const background = Color{
-        .r = 0,
-        .g = 0,
-        .b = 0,
-        .a = 255,
-    };
-
     var offset: usize = 0;
     while (offset < @divExact(size, 4)) : (offset += 1) {
         const i = offset * 4;
@@ -61,7 +67,10 @@ fn genBuffer(state: *DisplayState) !wl.Buffer {
     const pool = try state.context.*.shm.?.createPool(fd, size);
     defer pool.destroy();
 
-    return try pool.createBuffer(0, width, height, stride, wl.Shm.Format.argb8888);
+    return Buffer{
+        .buffer = try pool.createBuffer(0, width, height, stride, wl.Shm.Format.argb8888),
+        .fd = fd,
+    };
 }
 
 pub fn main() !void {
@@ -95,8 +104,38 @@ pub fn main() !void {
     std.debug.print(" Got all the context objects", .{});
     var display_state = DisplayState{ .context = &context };
 
-    const buffer = genBuffer(display_state);
-    defer buffer.destroy();
+    var buffer = try genBuffer(&display_state);
+    // var buffer: *wl.Buffer = blk: {
+    //     const width = display_state.dimensions.width;
+    //     const height = display_state.dimensions.height;
+    //     const stride = width * 4;
+    //     const size = stride * height;
+
+    //     const fd = try os.memfd_create("handmade-hero-zig-0", 0);
+    //     try os.ftruncate(fd, @intCast(size));
+    //     const data = try os.mmap(null, @intCast(size), os.PROT.READ | os.PROT.WRITE, os.MAP.SHARED, fd, 0);
+    //     const background = Color{
+    //         .r = 0,
+    //         .g = 0,
+    //         .b = 0,
+    //         .a = 255,
+    //     };
+
+    //     var offset: usize = 0;
+    //     while (offset < @divExact(size, 4)) : (offset += 1) {
+    //         const i = offset * 4;
+    //         data[i] = background.r;
+    //         data[i + 1] = background.g;
+    //         data[i + 2] = background.b;
+    //         data[i + 3] = background.a;
+    //     }
+    //     // @memset(data, background);
+
+    //     const pool = try shm.createPool(fd, size);
+    //     defer pool.destroy();
+
+    //     break :blk try pool.createBuffer(0, width, height, stride, wl.Shm.Format.argb8888);
+    // };
 
     const surface = try compositor.createSurface();
     defer surface.destroy();
@@ -114,19 +153,22 @@ pub fn main() !void {
     xdg_toplevel.setListener(*DisplayState, xdgToplevelListener, &display_state);
 
     xdg_toplevel.setTitle("Handmade Hero");
-    xdg_toplevel.setMaximized();
 
     surface.commit();
     if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
-    surface.attach(buffer, 0, 0);
+    surface.attach(buffer.buffer, 0, 0);
     surface.commit();
 
-    var buf = buffer;
     while (display_state.running) {
         if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
-        buf = genBuffer(display_state);
-        surface.attach(buf, 0, 0);
-        surface.commit();
+        if (display_state.resizing) {
+            const new_buffer = try genBuffer(&display_state);
+            buffer.buffer.destroy();
+            os.close(buffer.fd);
+            buffer = new_buffer;
+            surface.attach(new_buffer.buffer, 0, 0);
+            surface.commit();
+        }
     }
 }
 
@@ -168,13 +210,20 @@ fn xdgToplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, state: *Disp
     switch (event) {
         .configure => |config| {
             std.debug.print("Configuring toplevel: {any}\n", .{ .config = config });
+            var resizing = false;
 
             for (config.states.slice(xdg.Toplevel.State)) |s| {
-                std.debug.print("One of the states {d}\n", .{ .s = s });
+                std.debug.print("Handling toplevel state: {any}\n", .{ .s = s });
+                switch (s) {
+                    .resizing => resizing = true,
+                    .fullscreen => resizing = true,
+                    .maximized => resizing = true,
+                    else => {},
+                }
             }
-            // @breakpoint();
             state.dimensions.width = config.width;
             state.dimensions.height = config.height;
+            state.resizing = resizing;
         },
         .close => state.running = false,
         .configure_bounds => |bounds| {
