@@ -36,14 +36,43 @@ const Color = packed struct {
 const background = Color{
     .r = 0,
     .g = 0,
-    .b = 0,
+    .b = 255,
     .a = 128,
 };
 
 const Buffer = struct {
     buffer: *wl.Buffer,
     fd: os.fd_t,
+    data: []u8,
 };
+
+fn fill(data: []u8, state: *DisplayState, color: Color) void {
+    const width: usize = @intCast(state.dimensions.width);
+    const height: usize = @intCast(state.dimensions.height);
+    for (0..height) |h| {
+        for (0..width) |w| {
+            const i = (w + (h * width)) * 4;
+            data[i] = color.b;
+            data[i + 1] = color.g;
+            data[i + 2] = color.r;
+            data[i + 3] = color.a;
+        }
+    }
+}
+
+fn gradient(data: []u8, state: *DisplayState, color: Color, offset: usize) void {
+    const width: usize = @intCast(state.dimensions.width);
+    const height: usize = @intCast(state.dimensions.height);
+    for (0..height) |h| {
+        for (0..width) |w| {
+            const i = (w + (h * width)) * 4;
+            data[i] = @truncate(h + offset);
+            data[i + 1] = @truncate(w + offset);
+            data[i + 2] = 0;
+            data[i + 3] = color.a;
+        }
+    }
+}
 
 fn genBuffer(state: *DisplayState) !Buffer {
     const width = state.dimensions.width;
@@ -54,15 +83,7 @@ fn genBuffer(state: *DisplayState) !Buffer {
     const fd = try os.memfd_create("handmade-hero-zig-0", 0);
     try os.ftruncate(fd, @intCast(size));
     const data = try os.mmap(null, @intCast(size), os.PROT.READ | os.PROT.WRITE, os.MAP.SHARED, fd, 0);
-    var offset: usize = 0;
-    while (offset < @divExact(size, 4)) : (offset += 1) {
-        const i = offset * 4;
-        data[i] = background.r;
-        data[i + 1] = background.g;
-        data[i + 2] = background.b;
-        data[i + 3] = background.a;
-    }
-    // @memset(data, background);
+    fill(data, state, background);
 
     const pool = try state.context.*.shm.?.createPool(fd, size);
     defer pool.destroy();
@@ -70,15 +91,14 @@ fn genBuffer(state: *DisplayState) !Buffer {
     return Buffer{
         .buffer = try pool.createBuffer(0, width, height, stride, wl.Shm.Format.argb8888),
         .fd = fd,
+        .data = data,
     };
 }
 
 pub fn main() !void {
     std.debug.print("Starting main\n", .{});
     const display = try wl.Display.connect(null);
-    std.debug.print("Connected the display: {?}\n", .{ .display = display });
     const registry = try display.getRegistry();
-    std.debug.print("Connected the registry\n", .{});
 
     var context = Context{
         .shm = null,
@@ -159,17 +179,75 @@ pub fn main() !void {
     surface.attach(buffer.buffer, 0, 0);
     surface.commit();
 
+    const poll_wayland = 0;
+    var pollfds = [_]os.pollfd{
+        .{ .fd = display.getFd(), .events = os.POLL.IN, .revents = 0 },
+    };
+
+    var offset: usize = 0;
     while (display_state.running) {
-        if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
+        std.debug.print("Main loop...\n", .{});
+        try flush_and_prepare_read(display);
+        std.debug.print("flushed...\n", .{});
+
+        _ = os.poll(&pollfds, 1) catch |err| {
+            fatal("poll failed: {any}\n", .{ .err = err });
+        };
+        std.debug.print("polled...\n", .{});
+
+        if (pollfds[poll_wayland].revents & os.POLL.IN != 0) {
+            const errno = display.readEvents();
+            if (errno != .SUCCESS) {
+                fatal("error reading wayland events: {any}\n", .{ .err = errno });
+            }
+        } else {
+            display.cancelRead();
+        }
+        std.debug.print("events...\n", .{});
+
         if (display_state.resizing) {
             const new_buffer = try genBuffer(&display_state);
             buffer.buffer.destroy();
             os.close(buffer.fd);
             buffer = new_buffer;
-            surface.attach(new_buffer.buffer, 0, 0);
-            surface.commit();
+        }
+
+        std.debug.print("Filling gradient", .{});
+        gradient(buffer.data, &display_state, background, offset);
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damage(0, 0, display_state.dimensions.width, display_state.dimensions.height);
+        surface.commit();
+        offset += 1;
+    }
+}
+
+fn flush_and_prepare_read(display: *wl.Display) !void {
+    while (!display.prepareRead()) {
+        if (display.dispatchPending() != .SUCCESS) return error.DispatchPendingFailed;
+    }
+
+    while (true) {
+        const errno = display.flush();
+        switch (errno) {
+            .SUCCESS => return,
+            .PIPE => {
+                _ = display.readEvents();
+                fatal("Pipe error after flush\n", .{});
+            },
+            .AGAIN => {
+                var wayland_out = [_]os.pollfd{.{ .fd = display.getFd(), .events = os.POLL.OUT, .revents = 0 }};
+                _ = os.poll(&wayland_out, -1) catch |err| {
+                    fatal("poll failed after AGAIN: {any}\n", .{ .err = err });
+                };
+            },
+            else => fatal("Failed to flush requests: {any}", .{ .err = errno }),
         }
     }
+}
+
+fn fatal(comptime msg: []const u8, args: anytype) noreturn {
+    std.debug.print(msg, args);
+    os.exit(11);
 }
 
 fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, context: *Context) void {

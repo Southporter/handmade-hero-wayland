@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.addModule("wayland", wayland);
+    // exe.step.dependOn(&scanner.step);
     exe.linkLibC();
     exe.linkSystemLibrary("wayland-client");
 
