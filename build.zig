@@ -38,9 +38,14 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.addModule("wayland", wayland);
-    // exe.step.dependOn(&scanner.step);
+    exe.addModule("xkb", b.createModule(.{
+        .source_file = .{
+            .path = "deps/zig-xkbcommon/src/xkbcommon.zig",
+        },
+    }));
     exe.linkLibC();
     exe.linkSystemLibrary("wayland-client");
+    exe.linkSystemLibrary("xkbcommon");
 
     scanner.addCSource(exe);
 
