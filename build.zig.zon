@@ -1,0 +1,18 @@
+.{
+    .name = "handmade-hero-wayland",
+    .version = "0.0.1",
+    .dependencies = .{
+        .mach_sysaudio = .{
+            .url = "https://pkg.machengine.org/mach-sysaudio/f272775a5592f91c0b345b5fb4148f00f2f53f21.tar.gz",
+            .hash = "1220f3c77dd37441bdc40f1119b78954f60f367e18f38a0a3fdb40cb4787fce32b83",
+        },
+        .mach_sysjs = .{
+            .url = "https://pkg.machengine.org/mach-sysjs/e797fff049c0bb6e374cdc246bcf8e1347ecc25e.tar.gz",
+            .hash = "12203243e35c2518a9d64d98e9f3ee21f79f0175f4c13a61231feb0a37e3fe5d5070",
+        },
+        .linux_audio_headers = .{
+            .url = "https://pkg.machengine.org/linux-audio-headers/a239b310fe45bfc974c121be2c9908e51a0c027d.tar.gz",
+            .hash = "1220ceab34e6617e3ff7be14477b1aea34b6e091c1e4316406ce474fca2293af831a",
+        },
+    },
+}
