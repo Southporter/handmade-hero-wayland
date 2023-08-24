@@ -1,5 +1,6 @@
 const std = @import("std");
 const Scanner = @import("deps/zig-wayland/build.zig").Scanner;
+const mach_sysaudio = @import("mach_sysaudio");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -25,6 +26,7 @@ pub fn build(b: *std.Build) void {
 
     scanner.generate("wl_compositor", 5);
     scanner.generate("wl_shm", 1);
+    scanner.generate("wl_seat", 7);
     scanner.generate("xdg_wm_base", 4);
     scanner.generate("zxdg_decoration_manager_v1", 1);
 
@@ -43,9 +45,11 @@ pub fn build(b: *std.Build) void {
             .path = "deps/zig-xkbcommon/src/xkbcommon.zig",
         },
     }));
+    exe.addModule("mach-sysaudio", mach_sysaudio.module(b, optimize, target));
     exe.linkLibC();
     exe.linkSystemLibrary("wayland-client");
     exe.linkSystemLibrary("xkbcommon");
+    mach_sysaudio.link(b, exe);
 
     scanner.addCSource(exe);
 

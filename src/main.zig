@@ -2,10 +2,14 @@ const std = @import("std");
 const mem = std.mem;
 const os = std.os;
 
+const sysaudio = @import("mach-sysaudio");
 const wayland = @import("wayland");
+const xkb = @import("xkb");
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
 const zxdg = wayland.client.zxdg;
+
+const debug = std.log.debug;
 
 const Dimensions = struct {
     width: i32 = 512,
@@ -18,6 +22,13 @@ const DisplayState = struct {
     context: *Context,
     running: bool = true,
     resizing: bool = false,
+    frameData: FrameData,
+};
+
+const KeyState = struct {
+    keyboard: *wl.Keyboard,
+    xkb_state: ?*xkb.State = null,
+    xkb_context: *xkb.Context,
 };
 
 const Context = struct {
@@ -25,6 +36,7 @@ const Context = struct {
     compositor: ?*wl.Compositor,
     wm_base: ?*xdg.WmBase,
     decoration_manager: ?*zxdg.DecorationManagerV1,
+    seat: ?*wl.Seat,
 };
 
 const Color = packed struct {
@@ -47,6 +59,17 @@ const Buffer = struct {
     data: []u32,
 };
 
+const FrameData = struct {
+    lastFrame: u32,
+    offset: f32,
+    surface: *wl.Surface,
+};
+
+const AudioState = struct {
+    ctx: *sysaudio.Context,
+    player: ?*sysaudio.Player,
+};
+
 fn fill(data: []u32, state: *DisplayState, color: Color) void {
     const width: usize = @intCast(state.dimensions.width);
     const height: usize = @intCast(state.dimensions.height);
@@ -61,7 +84,8 @@ fn fill(data: []u32, state: *DisplayState, color: Color) void {
     }
 }
 
-fn gradient(data: []u32, state: *DisplayState, color: Color, offset: usize) void {
+fn gradient(data: []u32, state: *DisplayState, color: Color) void {
+    const offset: u32 = @intFromFloat(state.frameData.offset);
     _ = color;
     const width: usize = @intCast(state.dimensions.width);
     const height: usize = @intCast(state.dimensions.height);
@@ -110,6 +134,7 @@ pub fn main() !void {
         .compositor = null,
         .wm_base = null,
         .decoration_manager = null,
+        .seat = null,
     };
 
     registry.setListener(*Context, registryListener, &context);
@@ -121,12 +146,22 @@ pub fn main() !void {
     const compositor = context.compositor orelse return error.NoWlCompositor;
     const wm_base = context.wm_base orelse return error.NoXdgWmBase;
     const decoration_manager = context.decoration_manager orelse return error.NoXdgDecorationManager;
+    const seat = context.seat orelse return error.NoWlSeat;
+    seat.setListener(*wl.Seat, wlSeatListener, seat);
 
-    var display_state = DisplayState{ .context = &context };
-
-    var buffer = try genBuffer(&display_state);
     const surface = try compositor.createSurface();
     defer surface.destroy();
+
+    var display_state = DisplayState{
+        .context = &context,
+        .frameData = FrameData{
+            .surface = surface,
+            .offset = 0,
+            .lastFrame = 0,
+        },
+    };
+
+    var buffer = try genBuffer(&display_state);
     const xdg_surface = try wm_base.getXdgSurface(surface);
     defer xdg_surface.destroy();
     const xdg_toplevel = try xdg_surface.getToplevel();
@@ -144,47 +179,61 @@ pub fn main() !void {
 
     surface.commit();
     if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+
+    var keyboard = try seat.getKeyboard();
+    var xkb_context = xkb.Context.new(.no_flags) orelse return error.NoXkbContext;
+    var keyHandler = KeyState{
+        .keyboard = keyboard,
+        .xkb_context = xkb_context,
+    };
+    keyboard.setListener(*KeyState, keyboardHandler, &keyHandler);
+    defer keyboard.release();
     surface.attach(buffer.buffer, 0, 0);
     surface.commit();
 
-    const poll_wayland = 0;
-    var pollfds = [_]os.pollfd{
-        .{ .fd = display.getFd(), .events = os.POLL.IN, .revents = 0 },
+    const done = try surface.frame();
+    done.setListener(*DisplayState, frameHandler, &display_state);
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    defer {
+        const deinit_status = gpa.deinit();
+        if (deinit_status == .leak) std.testing.expect(false) catch @panic("MEM TEST FAIL");
+    }
+    var audio_ctx = try sysaudio.Context.init(.pipewire, allocator, .{ .deviceChangeFn = deviceChange });
+    defer audio_ctx.deinit();
+    try audio_ctx.refresh();
+    const device = audio_ctx.defaultDevice(.playback) orelse return error.NoAudioDevice;
+    var audio_state = AudioState{
+        .ctx = &audio_ctx,
+        .player = null,
     };
+    var player = try audio_ctx.createPlayer(device, writeCallback, .{
+        .media_role = .game,
+        .user_data = &audio_state,
+    });
+    defer player.deinit();
+    audio_state.player = &player;
+    try player.start();
+    try player.setVolume(0.65);
+    try player.play();
 
-    var offset: usize = 0;
     while (display_state.running) {
-        try flush_and_prepare_read(display);
+        if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
+        // try flush_and_prepare_read(display);
 
-        _ = os.poll(&pollfds, 1) catch |err| {
-            fatal("poll failed: {any}\n", .{ .err = err });
-        };
+        // _ = os.poll(&pollfds, 1) catch |err| {
+        //     fatal("poll failed: {any}\n", .{ .err = err });
+        // };
 
-        if (pollfds[poll_wayland].revents & os.POLL.IN != 0) {
-            const errno = display.readEvents();
-            if (errno != .SUCCESS) {
-                fatal("error reading wayland events: {any}\n", .{ .err = errno });
-            }
-        } else {
-            display.cancelRead();
-        }
-
-        if (display_state.resizing) {
-            const new_buffer = try genBuffer(&display_state);
-            buffer.buffer.destroy();
-            os.close(buffer.fd);
-            buffer = new_buffer;
-            fill(new_buffer.data, &display_state, background);
-            surface.attach(new_buffer.buffer, 0, 0);
-            surface.damage(0, 0, display_state.dimensions.width, display_state.dimensions.height);
-            surface.commit();
-        }
-
-        gradient(buffer.data, &display_state, background, offset);
-        surface.attach(buffer.buffer, 0, 0);
-        surface.damage(64, 64, display_state.dimensions.width - 128, display_state.dimensions.height - 128);
-        surface.commit();
-        offset += 1;
+        // if (pollfds[poll_wayland].revents & os.POLL.IN != 0) {
+        //     const errno = display.readEvents();
+        //     if (errno != .SUCCESS) {
+        //         fatal("error reading wayland events: {any}\n", .{ .err = errno });
+        //     }
+        // } else {
+        //     display.cancelRead();
+        // }
     }
 }
 
@@ -213,8 +262,19 @@ fn flush_and_prepare_read(display: *wl.Display) !void {
 }
 
 fn fatal(comptime msg: []const u8, args: anytype) noreturn {
-    std.debug.print(msg, args);
+    std.log.err(msg, args);
     os.exit(11);
+}
+
+pub fn log(
+    comptime message_level: std.log.Level,
+    comptime scope: @Type(.EnumLiteral),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    std.debug.print("[{s}](s) ", .{ message_level.asText(), @tagName(scope) });
+    std.debug.print(format, args);
+    std.debug.print("\n");
 }
 
 fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, context: *Context) void {
@@ -228,6 +288,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, context: *
                 context.wm_base = registry.bind(global.name, xdg.WmBase, 1) catch return;
             } else if (mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.getInterface().name) == .eq) {
                 context.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, 1) catch return;
+            } else if (mem.orderZ(u8, global.interface, wl.Seat.getInterface().name) == .eq) {
+                context.seat = registry.bind(global.name, wl.Seat, 1) catch return;
             }
         },
         .global_remove => {},
@@ -254,11 +316,11 @@ fn xdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, surfa
 fn xdgToplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, state: *DisplayState) void {
     switch (event) {
         .configure => |config| {
-            std.debug.print("Configuring toplevel: {any}\n", .{ .config = config });
+            // std.debug.print("Configuring toplevel: {any}\n", .{ .config = config });
             var resizing = false;
 
             for (config.states.slice(xdg.Toplevel.State)) |s| {
-                std.debug.print("Handling toplevel state: {any}\n", .{ .s = s });
+                // std.debug.print("Handling toplevel state: {any}\n", .{ .s = s });
                 switch (s) {
                     .resizing => resizing = true,
                     .fullscreen => resizing = true,
@@ -272,7 +334,7 @@ fn xdgToplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, state: *Disp
         },
         .close => state.running = false,
         .configure_bounds => |bounds| {
-            std.debug.print("Getting bounds: {any}\n", .{ .bounds = bounds });
+            debug("Getting bounds: {any}\n", .{ .bounds = bounds });
         },
         // .wm_capabilities => {},
     }
@@ -281,18 +343,151 @@ fn xdgToplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, state: *Disp
 fn zxdgToplevelDecorationListener(_: *zxdg.ToplevelDecorationV1, event: zxdg.ToplevelDecorationV1.Event, _: *zxdg.ToplevelDecorationV1) void {
     switch (event) {
         .configure => |configure| {
-            std.debug.print("Configuring toplevel decoration: {any}\n", configure);
+            debug("Configuring toplevel decoration: {any}", configure);
             switch (configure.mode) {
                 .server_side => {
-                    std.debug.print("Decoration is serverside. Nothing to do here...\n", .{});
+                    debug("Decoration is serverside. Nothing to do here...", .{});
                 },
                 .client_side => {
-                    std.debug.print("Decoration needs to be client side!\n", .{});
+                    debug("Decoration needs to be client side!", .{});
                 },
                 _ => {
-                    std.debug.print("Unknown decoration configure mode\n", .{});
+                    debug("Unknown decoration configure mode\n", .{});
                 },
             }
         },
+    }
+}
+
+fn wlSeatListener(_: *wl.Seat, event: wl.Seat.Event, _: *wl.Seat) void {
+    switch (event) {
+        .capabilities => |cap| {
+            debug("Configuration for seat capability: {any}\n", .{cap});
+            if (!cap.capabilities.keyboard) {
+                os.exit(122);
+            }
+        },
+        .name => |evt| {
+            debug("Found seat name: {s}\n", .{evt.name});
+        },
+    }
+}
+
+const WL_XKB_KEYCODE_OFFSET = 8;
+
+fn keyboardHandler(_: *wl.Keyboard, event: wl.Keyboard.Event, state: *KeyState) void {
+    switch (event) {
+        .enter => {},
+        .leave => {},
+        .repeat_info => {},
+        .keymap => |kev| {
+            defer os.close(kev.fd);
+            const keymap_str = os.mmap(null, kev.size, os.PROT.READ, os.MAP.PRIVATE, kev.fd, 0) catch |err| {
+                debug("Unable to mmap keymap fd: {s}\n", .{@errorName(err)});
+                return;
+            };
+            defer os.munmap(keymap_str);
+
+            const keymap = xkb.Keymap.newFromBuffer(
+                state.xkb_context,
+                keymap_str.ptr,
+                keymap_str.len - 1,
+                .text_v1,
+                .no_flags,
+            ) orelse {
+                debug("Unable to get keymap\n", .{});
+                return;
+            };
+
+            defer keymap.unref();
+            const xkb_state = xkb.State.new(keymap) orelse {
+                debug("Failed to create kb state\n", .{});
+                return;
+            };
+            defer xkb_state.unref();
+            if (state.xkb_state) |s| s.unref();
+            state.xkb_state = xkb_state.ref();
+        },
+        .modifiers => |kev| {
+            if (state.xkb_state) |kb_state| {
+                _ = kb_state.updateMask(
+                    kev.mods_depressed,
+                    kev.mods_latched,
+                    kev.mods_locked,
+                    0,
+                    0,
+                    kev.group,
+                );
+            }
+        },
+        .key => |kev| {
+            if (kev.state != .pressed) return;
+            const kb_state = state.xkb_state orelse return;
+            const keycode = kev.key + WL_XKB_KEYCODE_OFFSET;
+            // const sym = kb_state.keyGetOneSym(keycode);
+            // if (keysym == .NoSymbol) return;
+            const keymap = kb_state.getKeymap();
+            const name = keymap.keyGetName(keycode);
+            debug("Got key: {?s}\n", .{name});
+        },
+    }
+}
+
+fn frameHandler(cb: *wl.Callback, event: wl.Callback.Event, data: *DisplayState) void {
+    defer cb.destroy();
+    switch (event) {
+        .done => |evt| {
+            const frameCb = data.frameData.surface.frame() catch |err| {
+                fatal("Error getting callback: {any}\n", .{err});
+            };
+            frameCb.setListener(*DisplayState, frameHandler, data);
+
+            if (data.frameData.lastFrame != 0) {
+                const elapsed = evt.callback_data - data.frameData.lastFrame;
+                const delta = @as(f32, @floatFromInt(elapsed)) / 1000.0 * 48.0;
+
+                data.frameData.offset += delta;
+            }
+
+            const buffer = genBuffer(data) catch |err| {
+                fatal("Could not generate a buffer in frame callback: {any}\n", .{err});
+            };
+            defer os.close(buffer.fd);
+            fill(buffer.data, data, background);
+            var surface = data.frameData.surface;
+            surface.attach(buffer.buffer, 0, 0);
+            surface.damage(0, 0, data.dimensions.width, data.dimensions.height);
+            surface.commit();
+
+            gradient(buffer.data, data, background);
+            surface.attach(buffer.buffer, 0, 0);
+            surface.damage(64, 64, data.dimensions.width - 128, data.dimensions.height - 128);
+            surface.commit();
+
+            data.frameData.lastFrame = evt.callback_data;
+        },
+    }
+}
+
+fn deviceChange(device: ?*anyopaque) void {
+    std.log.info("A device change event happend: {?any}", .{device});
+}
+
+const pitch = 440.0;
+const radians_per_second = pitch * 2.0 * std.math.pi;
+var seconds_offset: f32 = 0.0;
+fn writeCallback(user_data: ?*anyopaque, frames: usize) void {
+    std.log.info("{d} audio frames: {?any}", .{ frames, user_data });
+    if (user_data) |data| {
+        const state: *AudioState = @alignCast(@ptrCast(data));
+        if (state.player) |player| {
+            const seconds_per_frame = 1.0 / @as(f32, @floatFromInt(player.sampleRate()));
+            for (0..frames) |f| {
+                const sample = std.math.sin((seconds_offset + @as(f32, @floatFromInt(f)) * seconds_per_frame) * radians_per_second);
+
+                player.writeAll(f, sample);
+            }
+            seconds_offset = @mod(seconds_offset + seconds_per_frame * @as(f32, @floatFromInt(frames)), 1.0);
+        }
     }
 }
